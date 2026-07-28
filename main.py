@@ -16,7 +16,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 # Render gives you a public URL (e.g., https://my-bot.onrender.com). 
 # We'll use that to construct the log URL automatically if deployed.
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8000")
-LOG_URL = f"{RENDER_EXTERNAL_URL}/log" 
+LOG_URL = f"{RENDER_EXTERNAL_URL}/run.jsonl"
 
 LOG_FILE = "run.jsonl"
 # -------------------------------------------
