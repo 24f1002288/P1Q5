@@ -9,14 +9,12 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
 # --- Configuration ---
-# It is highly recommended to use environment variables for secrets on Render
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "YOUR_GROQ_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 
-# Render gives you a public URL (e.g., https://my-bot.onrender.com). 
-# We'll use that to construct the log URL automatically if deployed.
+# Use the exact correct route for wget compliance
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8000")
-LOG_URL = f"{RENDER_EXTERNAL_URL}/run.jsonl"
+LOG_URL = f"{RENDER_EXTERNAL_URL}/run.jsonl" 
 
 LOG_FILE = "run.jsonl"
 # -------------------------------------------
@@ -31,6 +29,7 @@ conversation_history = {}
 def log_event(event: dict):
     event["timestamp"] = time.time()
     with open(LOG_FILE, "a") as f:
+        # JSONL format: one JSON object per line
         f.write(json.dumps(event) + "\n")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -41,31 +40,55 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history = conversation_history.setdefault(chat_id, [])
     history.append({"role": "user", "content": user_text})
 
+    # Updated system prompt to strictly enforce the grading spec
     system_prompt = (
-        "You are a careful data analyst. The user's LAST message asks a data-analysis "
-        "question and tells you exactly what JSON shape to reply with. Work out the "
-        "real answer (use any public data you know, e.g. MOSPI statistics, general "
-        "world knowledge, or arithmetic on numbers given in the message). "
-        "Reply with ONLY that exact JSON object and absolutely nothing else — no "
-        "explanation, no markdown, no code fences, just the raw JSON."
+        "You are an expert data analyst. The user's LAST message asks a data-analysis "
+        "question and provides the EXACT JSON shape you must reply with. "
+        "Work out the answer using your internal knowledge (e.g., MOSPI statistics). "
+        "Your final reply MUST be a single, valid JSON object containing exactly two keys: "
+        "'answer' (shaped exactly as the user requested) and 'log_url'. "
+        "Output ONLY raw JSON. No markdown formatting, no code fences, no explanations."
     )
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "system", "content": system_prompt}] + history[-6:],
-    )
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "system", "content": system_prompt}] + history[-6:],
+            temperature=0.1, # Lower temperature for more reliable JSON formatting
+        )
+        reply_text = response.choices[0].message.content.strip()
+        history.append({"role": "assistant", "content": reply_text})
+    except Exception as e:
+        reply_text = '{"answer": "error generating response"}'
 
-    reply_text = response.choices[0].message.content.strip()
-    history.append({"role": "assistant", "content": reply_text})
-
+    # Robust extraction: Strip markdown if the LLM accidentally adds it
     try:
         parsed = json.loads(reply_text)
     except json.JSONDecodeError:
         start, end = reply_text.find("{"), reply_text.rfind("}")
-        parsed = json.loads(reply_text[start:end + 1])
+        if start != -1 and end != -1:
+            try:
+                parsed = json.loads(reply_text[start:end + 1])
+            except Exception:
+                parsed = {"answer": reply_text}
+        else:
+            parsed = {"answer": reply_text}
 
-    parsed["log_url"] = LOG_URL
-    final_reply = json.dumps(parsed)
+    # GRADING SPEC ENFORCEMENT: 
+    # The final payload MUST be exactly {"answer": <data>, "log_url": <url>}
+    
+    # 1. If the LLM forgot the "answer" wrapper and just returned the raw data, wrap it.
+    if "answer" not in parsed:
+        parsed = {"answer": parsed}
+
+    # 2. Rebuild the final object from scratch to guarantee NO extra hallucinated root keys exist
+    final_reply_obj = {
+        "answer": parsed["answer"],
+        "log_url": LOG_URL
+    }
+
+    # Convert to a clean JSON string with no extra spaces/markdown
+    final_reply = json.dumps(final_reply_obj)
 
     log_event({"type": "outgoing", "chat_id": chat_id, "text": final_reply})
     await update.message.reply_text(final_reply)
@@ -77,13 +100,11 @@ ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messa
 # Define the FastAPI Lifespan to run the Telegram bot concurrently
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Start the Telegram bot polling
     await ptb_app.initialize()
     await ptb_app.start()
     await ptb_app.updater.start_polling()
     print("Telegram bot is polling...")
     yield
-    # Shutdown: Gracefully stop the bot
     print("Stopping Telegram bot...")
     await ptb_app.updater.stop()
     await ptb_app.stop()
@@ -99,9 +120,10 @@ def health_check():
     """Route for your Cronjob / Keep-alive service to ping."""
     return {"status": "alive", "timestamp": time.time()}
 
-@app.get("/log")
+# Updated route to exactly match the desired filename for wget
+@app.get("/run.jsonl")
 def serve_log_file():
-    """Serves the run.jsonl file. It can be downloaded via wget or a browser."""
+    """Serves the run.jsonl file. It can be downloaded via wget naturally."""
     if os.path.exists(LOG_FILE):
         return FileResponse(
             path=LOG_FILE, 
