@@ -31,6 +31,17 @@ client = OpenAI(
 conversation_history = {}
 
 
+def strip_think_block(text: str) -> str:
+    """Remove a <think>...</think> reasoning block some models emit before
+    their actual output, so downstream JSON parsing isn't confused by braces
+    that may appear inside the reasoning trace."""
+    start = text.find("<think>")
+    end = text.find("</think>")
+    if start != -1 and end != -1 and end > start:
+        text = text[:start] + text[end + len("</think>"):]
+    return text.strip()
+
+
 def log_event(event: dict):
     event["timestamp"] = time.time()
     with open(LOG_FILE, "a") as f:
@@ -65,8 +76,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             model="qwen/qwen3.6-27b",
             messages=[{"role": "system", "content": system_prompt}] + history[-6:],
             temperature=0.1,  # Lower temperature for more reliable JSON formatting
+            reasoning_effort="none",  # Ask Groq to skip the <think> trace entirely
         )
         reply_text = response.choices[0].message.content.strip()
+        # Safety net: some reasoning models still emit a <think>...</think> block
+        # even when asked not to — strip it before we try to parse JSON out of it.
+        reply_text = strip_think_block(reply_text)
         history.append({"role": "assistant", "content": reply_text})
     except Exception:
         reply_text = '{"answer": "error generating response"}'
@@ -133,6 +148,11 @@ ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messa
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await ptb_app.initialize()
+    # Clear any stale webhook/getUpdates lock left by a previous instance
+    # (e.g. an old Render deploy that hasn't fully shut down yet) before
+    # starting our own poller, to avoid "Conflict: terminated by other
+    # getUpdates request" errors.
+    await ptb_app.bot.delete_webhook(drop_pending_updates=False)
     await ptb_app.start()
     await ptb_app.updater.start_polling()
     print("Telegram bot is polling...")
