@@ -52,7 +52,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="qwen/qwen3.6-27b",
             messages=[{"role": "system", "content": system_prompt}] + history[-6:],
             temperature=0.1, # Lower temperature for more reliable JSON formatting
         )
