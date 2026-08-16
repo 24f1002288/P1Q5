@@ -1,4 +1,5 @@
 import json
+import io
 import time
 import os
 from contextlib import asynccontextmanager
@@ -6,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from openai import OpenAI
 from telegram import Update
+from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
 # --- Configuration ---
@@ -14,9 +16,12 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 
 # Use the exact correct route for wget compliance
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8000")
-LOG_URL = f"{RENDER_EXTERNAL_URL}/run.jsonl" 
+LOG_URL = f"{RENDER_EXTERNAL_URL}/run.jsonl"
 
 LOG_FILE = "run.jsonl"
+
+# Telegram's hard limit for a single text message
+TELEGRAM_MAX_LEN = 4096
 # -------------------------------------------
 
 client = OpenAI(
@@ -26,11 +31,13 @@ client = OpenAI(
 
 conversation_history = {}
 
+
 def log_event(event: dict):
     event["timestamp"] = time.time()
     with open(LOG_FILE, "a") as f:
         # JSONL format: one JSON object per line
         f.write(json.dumps(event) + "\n")
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -47,18 +54,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Work out the answer using your internal knowledge (e.g., MOSPI statistics). "
         "Your final reply MUST be a single, valid JSON object containing exactly two keys: "
         "'answer' (shaped exactly as the user requested) and 'log_url'. "
-        "Output ONLY raw JSON. No markdown formatting, no code fences, no explanations."
+        "Output ONLY raw JSON. No markdown formatting, no code fences, no explanations. "
+        "Keep the 'answer' value concise (well under 3000 characters total) by "
+        "summarizing, rounding numbers, or trimming lists rather than including "
+        "exhaustive detail."
     )
 
     try:
         response = client.chat.completions.create(
             model="qwen/qwen3.6-27b",
             messages=[{"role": "system", "content": system_prompt}] + history[-6:],
-            temperature=0.1, # Lower temperature for more reliable JSON formatting
+            temperature=0.1,  # Lower temperature for more reliable JSON formatting
         )
         reply_text = response.choices[0].message.content.strip()
         history.append({"role": "assistant", "content": reply_text})
-    except Exception as e:
+    except Exception:
         reply_text = '{"answer": "error generating response"}'
 
     # Robust extraction: Strip markdown if the LLM accidentally adds it
@@ -74,9 +84,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             parsed = {"answer": reply_text}
 
-    # GRADING SPEC ENFORCEMENT: 
+    # GRADING SPEC ENFORCEMENT:
     # The final payload MUST be exactly {"answer": <data>, "log_url": <url>}
-    
+
     # 1. If the LLM forgot the "answer" wrapper and just returned the raw data, wrap it.
     if "answer" not in parsed:
         parsed = {"answer": parsed}
@@ -91,11 +101,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     final_reply = json.dumps(final_reply_obj)
 
     log_event({"type": "outgoing", "chat_id": chat_id, "text": final_reply})
-    await update.message.reply_text(final_reply)
+
+    # Send the reply, falling back to a file if it's too long for a text message
+    await send_reply(update, final_reply, final_reply_obj)
+
+
+async def send_reply(update: Update, final_reply: str, final_reply_obj: dict):
+    """Sends final_reply as a text message, or as a JSON file if it exceeds
+    Telegram's per-message character limit. Never raises on send failure."""
+    try:
+        if len(final_reply) <= TELEGRAM_MAX_LEN:
+            await update.message.reply_text(final_reply)
+            return
+
+        # Too long for a single text message: send as a downloadable JSON file
+        file_bytes = io.BytesIO(final_reply.encode("utf-8"))
+        file_bytes.name = "answer.json"
+        await update.message.reply_document(
+            document=file_bytes,
+            filename="answer.json",
+            caption="Response exceeded Telegram's text limit, sent as a file instead.",
+        )
+    except BadRequest as e:
+        # Last-resort fallback: still try to get *something* useful to the user
+        log_event({"type": "send_error", "error": str(e)})
+        try:
+            fallback_obj = {
+                "answer": "Response too large to display; log_url has the full record.",
+                "log_url": final_reply_obj.get("log_url", LOG_URL),
+            }
+            await update.message.reply_text(json.dumps(fallback_obj))
+        except Exception as inner_e:
+            log_event({"type": "send_error_fatal", "error": str(inner_e)})
+    except Exception as e:
+        log_event({"type": "send_error", "error": str(e)})
+
 
 # Initialize the Telegram Application
 ptb_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
 
 # Define the FastAPI Lifespan to run the Telegram bot concurrently
 @asynccontextmanager
@@ -110,6 +155,7 @@ async def lifespan(app: FastAPI):
     await ptb_app.stop()
     await ptb_app.shutdown()
 
+
 # Initialize FastAPI
 app = FastAPI(lifespan=lifespan)
 
@@ -120,14 +166,15 @@ def health_check():
     """Route for your Cronjob / Keep-alive service to ping."""
     return {"status": "alive", "timestamp": time.time()}
 
+
 # Updated route to exactly match the desired filename for wget
 @app.get("/run.jsonl")
 def serve_log_file():
     """Serves the run.jsonl file. It can be downloaded via wget naturally."""
     if os.path.exists(LOG_FILE):
         return FileResponse(
-            path=LOG_FILE, 
-            filename="run.jsonl", 
+            path=LOG_FILE,
+            filename="run.jsonl",
             media_type="application/jsonl+json"
         )
     return {"error": "Log file not found yet. Send a message to the bot first."}
